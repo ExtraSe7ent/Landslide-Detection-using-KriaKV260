@@ -8,9 +8,9 @@ the edge.
 The detection backbone follows the LS-YOLO paper (Zhang et al., IEEE JSTARS 2024,
 built on Ultralytics YOLOv5). This repository adds:
 
-- a full training pipeline for a single-class (`landslide`) UAV dataset;
+- A full training pipeline for a single-class (`landslide`) UAV dataset;
 - DPU-friendly architecture changes so the model maps onto the Vitis-AI DPU;
-- an end-to-end **KV260 deployment** flow (quantization → compile → on-board demo/eval).
+- An end-to-end **KV260 deployment** flow (quantization → compile → on-board demo/eval).
 
 ## Results
 
