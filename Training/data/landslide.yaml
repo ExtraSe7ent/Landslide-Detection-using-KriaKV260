@@ -1,0 +1,15 @@
+# Landslide Detection Dataset
+# Images: datasets/images/<location>/img/<name>.tif
+# Labels: datasets/labels_yolo/<location>/<name>.txt
+
+train: datasets/splits/train.txt
+val:   datasets/splits/val.txt
+test:  datasets/splits/test.txt
+
+nc: 1
+names:
+  0: landslide
+
+# Custom label directory (used by img2label_paths override in dataloaders.py)
+label_dir: datasets/labels_yolo_clean
+img_subdir: img

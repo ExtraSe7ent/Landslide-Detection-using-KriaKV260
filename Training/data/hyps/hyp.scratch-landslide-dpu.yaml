@@ -1,0 +1,38 @@
+# Hyperparameters — train-from-scratch cho LS-YOLO bản DPU (Hardswish + SE-ECA)
+# Mục tiêu phụ: tăng độ bền với "domain gap" (khác cảm biến/độ sáng/góc xoay)
+# khi triển khai trên KV260, GIẢ ĐỊNH input vẫn là ảnh top-down (UAV/vệ tinh).
+# KHÔNG bù được khác biệt lớn (vd webcam mặt đất) — chỉ giúp khi domain gần giống.
+
+lr0: 0.01              # scratch (train từ đầu, weights '')
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+box: 0.05
+cls: 0.5
+cls_pw: 1.0
+obj: 1.0
+obj_pw: 1.0
+iou_t: 0.20
+anchor_t: 4.0
+fl_gamma: 0.0
+
+# ── Photometric: nới rộng để bền với khác biệt phơi sáng/màu của cảm biến triển khai ──
+hsv_h: 0.02            # (mặc định 0.015) — lệch tông màu nhẹ
+hsv_s: 0.7            # độ bão hoà
+hsv_v: 0.5            # (mặc định 0.4) — quan trọng nhất: bền với độ sáng/phơi sáng khác
+
+# ── Geometric: landslide nhìn top-down nên bất biến xoay/lật (đồng bộ với hyp.finetune-uav) ──
+degrees: 10.0          # xoay ±10° (UAV/vệ tinh chụp nhiều hướng)
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.5            # lật dọc OK với ảnh top-down
+fliplr: 0.5
+
+mosaic: 1.0
+mixup: 0.1             # (mặc định 0.0) — chút mixup giúp tổng quát hoá tốt hơn
+copy_paste: 0.0

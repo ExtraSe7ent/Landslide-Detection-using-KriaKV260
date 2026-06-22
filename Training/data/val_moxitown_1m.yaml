@@ -1,0 +1,8 @@
+img_subdir: img
+label_dir: datasets/labels_yolo_clean
+names:
+  0: landslide
+nc: 1
+train: datasets/splits/train_uav_only.txt
+val: datasets/splits/val_uav_only.txt
+test: datasets/splits/test_Moxi_town_UAV-1m_.txt
