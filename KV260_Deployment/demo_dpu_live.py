@@ -1,20 +1,44 @@
-"""
-demo_dpu_live.py — LS-YOLO inference on Kria KV260
-
-DPU: backbone + neck + Decoupled_Detect conv (m_stem, m_cls, cam, m_reg, m_conf)
-CPU: split channel → sigmoid → grid decode → NMS  (~few ms)
-"""
 import os, sys, time
 import cv2, numpy as np, torch
 import vart, xir
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(CURRENT_DIR, "../Training"))
+sys.path.append(os.path.join(CURRENT_DIR, "LS-YOLO"))
 from utils.general import non_max_suppression, scale_boxes
+
+# Need to add LS-YOLO to path to use letterbox
+try:
+    from utils.dataloaders import letterbox
+except ImportError:
+    # If import fails, create local letterbox
+    def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
+        shape = im.shape[:2]
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not scaleup:
+            r = min(r, 1.0)
+        ratio = r, r
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        if auto:
+            dw, dh = np.mod(dw, stride), np.mod(dh, stride)
+        elif scaleFill:
+            dw, dh = 0.0, 0.0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]
+        dw /= 2
+        dh /= 2
+        if shape[::-1] != new_unpad:
+            im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return im, ratio, (dw, dh)
 
 MODEL = os.path.join(CURRENT_DIR, "ls_yolo_landslide.xmodel")
 
-# ══ Parameters from Improve.yaml ══
+# ══ Parameters from models/landslide/Improve.yaml ══
 NC      = 1    # nc: 1
 NA      = 3    # 3 anchors per scale
 STRIDES = [8, 16, 32]
@@ -29,15 +53,24 @@ def make_grid(nx, ny):
     yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing='ij')
     return torch.stack((xv, yv), 2).view(1, 1, ny, nx, 2).float()
 
+_GRID_CACHE = {}
+_ANCHOR_CACHE = {}
+def get_grid_and_anchor(W, H, i):
+    key = (W, H, i)
+    if key not in _GRID_CACHE:
+        _GRID_CACHE[key] = make_grid(W, H)
+        _ANCHOR_CACHE[key] = torch.tensor(ANCHORS[i]).float().view(1, NA, 1, 1, 2)
+    return _GRID_CACHE[key], _ANCHOR_CACHE[key]
+
 
 def decode_decoupled(raw_list):
     """
-    Decode FullDPU output (from Decoupled_Detect).
+    Decode output of FullDPU (from Decoupled_Detect).
 
-    Channel layout per tensor: [4*NA reg | 1*NA conf | NC*NA cls]
+    Channel layout of each tensor: [4*NA reg | 1*NA conf | NC*NA cls]
     Example nc=1, na=3: [12 reg | 3 conf | 3 cls] = 18 channels
 
-    Returns: tensor [1, N_total, 5+NC] — formatted for non_max_suppression
+    Returns: tensor [1, N_total, 5+NC] — standard for non_max_suppression
     """
     z = []
     for i, raw in enumerate(raw_list):
@@ -53,12 +86,11 @@ def decode_decoupled(raw_list):
         conf = conf.view(bs, NA, 1,  H, W).permute(0, 1, 3, 4, 2)
         cls  = cls.view( bs, NA, NC, H, W).permute(0, 1, 3, 4, 2)
 
-        # Concat → [bs, NA, H, W, 5+NC] then sigmoid
+        # Concatenate → [bs, NA, H, W, 5+NC] then sigmoid
         y = torch.cat([reg, conf, cls], dim=-1).sigmoid()
 
-        # Grid + anchor decode
-        g = make_grid(W, H)
-        a = torch.tensor(ANCHORS[i]).float().view(1, NA, 1, 1, 2)
+        # Grid + anchor decode (cached)
+        g, a = get_grid_and_anchor(W, H, i)
         y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + g) * STRIDES[i]
         y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * a
 
@@ -83,7 +115,7 @@ def main():
 
     print(f"[INFO] Found {len(sg)} DPU subgraph(s).")
     if len(sg) > 1:
-        print("[WARN] More than 1 subgraph → some ops fell back to CPU → FPS will be lower.")
+        print("[WARN] More than 1 subgraph → some ops are not on DPU → lower FPS.")
 
     runner    = vart.Runner.create_runner(sg[0], "run")
     it        = runner.get_input_tensors()
@@ -103,10 +135,12 @@ def main():
     # ── Camera ────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    torch.set_num_threads(4)   # Use 4 ARM A53 cores
+    torch.set_num_threads(4)   # use all 4 ARM A53 cores
 
-    cv2.namedWindow("LS-YOLO KV260", cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty("LS-YOLO KV260", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    SHOW_DISPLAY = os.environ.get("DISPLAY") is not None
+    if SHOW_DISPLAY:
+        cv2.namedWindow("LS-YOLO KV260", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("LS-YOLO KV260", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     if not cap.isOpened():
         print("[ERROR] Cannot open camera!")
@@ -121,13 +155,16 @@ def main():
 
         # ── 1. DPU inference ──────────────────────────────────────────
         t0  = time.time()
-        img = cv2.cvtColor(cv2.resize(frame, (w, h)), cv2.COLOR_BGR2RGB)
+        # Fix 1: Use letterbox for correct ratio with scale_boxes
+        img_pad, _, _ = letterbox(frame, (h, w), auto=False)
+        img = cv2.cvtColor(img_pad, cv2.COLOR_BGR2RGB)
+        
         idata[0][0, ...] = (img.astype(np.float32) / 255.0 * in_scale).astype(np.int8)
         jid = runner.execute_async(idata, odata)
         runner.wait(jid)
         t_dpu = (time.time() - t0) * 1000
 
-        # ── 2. CPU decode (lightweight) ───────────────────────────────
+        # ── 2. CPU decode (lightweight) ───────────────────────────────────────
         t1 = time.time()
 
         # NHWC int8 → NCHW float32, sort P3→P4→P5 (spatial large → small)
@@ -141,7 +178,7 @@ def main():
         boxes = non_max_suppression(preds, conf_thres=0.25, iou_thres=0.45)[0]
         t_cpu = (time.time() - t1) * 1000
 
-        # ── 3. Draw results ───────────────────────────────────────────
+        # ── 3. Draw results ─────────────────────────────────────────────
         if boxes is not None and len(boxes):
             boxes[:, :4] = scale_boxes((h, w), boxes[:, :4], frame.shape).round()
             for *xy, conf, cls in boxes:
@@ -155,12 +192,19 @@ def main():
         cv2.putText(frame,
                     f"FPS:{fps:.1f}  DPU:{t_dpu:.1f}ms  CPU:{t_cpu:.1f}ms",
                     (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow("LS-YOLO KV260", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if SHOW_DISPLAY:
+            cv2.imshow("LS-YOLO KV260", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        else:
+            # Run in background without display, print FPS to terminal
+            print(f"[INFO] FPS: {fps:.1f} | DPU: {t_dpu:.1f}ms | CPU: {t_cpu:.1f}ms", end="\r")
 
     cap.release()
-    cv2.destroyAllWindows()
+    if SHOW_DISPLAY:
+        cv2.destroyAllWindows()
+    else:
+        print("\n[INFO] Stream ended.")
 
 
 if __name__ == "__main__":

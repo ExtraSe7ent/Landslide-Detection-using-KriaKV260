@@ -1,14 +1,14 @@
 """
 quantize_calib.py — Calibration for LS-YOLO with Decoupled_Detect.
-Fix: Read one image at a time instead of loading all into RAM to avoid OOM.
-Run INSIDE Docker Vitis-AI: python quantize_calib.py
+Supports running on both CPU (Mac) and GPU (Windows). Optimized speed with DataLoader (Batching).
 """
 import sys
-sys.path.append('../Training')
+sys.path.append('/workspace/LS-YOLO')
 import os, cv2, numpy as np
 import torch
 import torch.nn as nn
 from pytorch_nndct.apis import torch_quantizer
+from torch.utils.data import Dataset, DataLoader
 
 try:
     import seaborn
@@ -18,18 +18,23 @@ except ImportError:
         "opencv-python-headless", "seaborn", "pandas",
         "tqdm", "matplotlib", "pyyaml", "requests", "--quiet"])
 
-MODEL = "XXXXXX/best.pt"
-OUT   = "XXXXXX/compiled"
-CALIB = "XXXXXX/calib_images"
+MODEL = "/workspace/best_qat.pt"
+OUT   = "/workspace/compiled"
+CALIB = "/workspace/eval_kv260_dataset/test_images"  # Pointed directly to the directory containing 1017 test images
 os.makedirs(OUT, exist_ok=True)
 
-# ── FullDPU wrapper ──────────────────────────────────────────────
-class FullDPU(nn.Module):
+# Get optimal thread count (Allow full 100% resource utilization to reach 800%)
+if not torch.cuda.is_available():
+    torch.set_num_threads(os.cpu_count())
+
+# ── DecoupledDPU wrapper ──────────────────────────────────────────────
+class DecoupledDPU(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.layers = model.model
-        self.save   = model.save
+        self.save = model.save
         self.detect = model.model[-1]
+        assert hasattr(self.detect, 'm_stem'), "Need to use model with Decoupled_Detect head"
 
     def forward(self, x):
         y = [None] * len(self.layers)
@@ -39,80 +44,135 @@ class FullDPU(nn.Module):
             x = m(x)
             if m.i in self.save:
                 y[m.i] = x
-
         feats = [y[j] for j in self.detect.f]
-        outs  = []
-        for i in range(self.detect.nl):
-            xi     = self.detect.m_stem[i](feats[i])
-            x_cls  = self.detect.m_cls[i](xi)
-            x_cam  = self.detect.cam[i](xi)
-            x_reg  = self.detect.m_reg[i](x_cam)
-            x_conf = self.detect.m_conf[i](x_cam)
-            outs.append(torch.cat([x_reg, x_conf, x_cls], dim=1))
+        d = self.detect
+        outs = []
+        for i in range(d.nl):
+            stem = d.m_stem[i](feats[i])
+            cls_raw = d.m_cls[i](stem)
+            cam = d.cam[i](stem)
+            reg_raw = d.m_reg[i](cam)
+            conf_raw = d.m_conf[i](cam)
+            outs.append(torch.cat([reg_raw, conf_raw, cls_raw], dim=1))
         return tuple(outs)
 
-# ── Get file list (do not load into RAM) ─────────────────────────
-def get_calib_files():
-    if not os.path.exists(CALIB):
-        raise RuntimeError(f"[ERROR] Not found: {CALIB}")
+# ── Dataset for reading images ────────────────────────────────────────────────
+class CalibDataset(Dataset):
+    def __init__(self, img_dir, limit=None):
+        if not os.path.exists(img_dir):
+            raise RuntimeError(f"[ERROR] Not found: {img_dir}")
+        self.img_dir = img_dir
+        self.files = sorted([f for f in os.listdir(img_dir)
+                             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))
+                             and not f.startswith('.')])
+        if limit is not None:
+            self.files = self.files[:limit]
+        if not self.files:
+            raise RuntimeError(f"[ERROR] No valid images in {img_dir}")
+        
+        # Import local letterbox (fallback between dataloaders and augmentations)
+        sys.path.append('/workspace/LS-YOLO')
+        try:
+            from utils.augmentations import letterbox
+            self.letterbox = letterbox
+        except ImportError:
+            try:
+                from utils.dataloaders import letterbox
+                self.letterbox = letterbox
+            except ImportError:
+                raise RuntimeError("[ERROR] Cannot find letterbox function in LS-YOLO/utils/")
 
-    files = sorted([f for f in os.listdir(CALIB)
-                    if f.lower().endswith(('.jpg', '.png', '.tif', '.tiff'))
-                    and not f.startswith('.')])[:1000]
+    def __len__(self):
+        return len(self.files)
 
-    if not files:
-        raise RuntimeError(f"[ERROR] No valid images in {CALIB}")
+    def __getitem__(self, idx):
+        path = os.path.join(self.img_dir, self.files[idx])
+        im = cv2.imread(path)
+        if im is None:
+            # Fallback black tensor if image error
+            return torch.zeros((3, 512, 512), dtype=torch.float32)
+        im = self.letterbox(im, (512, 512), auto=False)[0]
+        im = im[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+        return torch.from_numpy(im)
 
-    print(f"[INFO] Found {len(files)} calibration images.")
-    return files
-
-# ── Read single image ───────────────────────────────────────────
-def load_one(path):
-    im = cv2.imread(path)
-    if im is None:
-        return None
-    im = cv2.resize(im, (512, 512))
-    im = im[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
-    return torch.from_numpy(im).unsqueeze(0)   # [1, 3, 512, 512]
+# ── Legacy ECA (For old best_qat.pt) ─────────────────────────
+class LegacyECA(nn.Module):
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.fc2(y)
+        y = self.gate(y)
+        # Remove .expand_as(x) to eliminate nndct_expand_as node not supported by DPU hardware
+        # Since fc1 and fc2 are Conv2d, y is already in [B, C, 1, 1] shape, PyTorch will broadcast smoothly.
+        return x * y
 
 # ── Main ────────────────────────────────────────────────────────
 def main():
-    print("[INFO] Loading best.pt...")
-    m = torch.load(MODEL, map_location='cpu', weights_only=False)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[INFO] Running on device: {device}")
+    print("[INFO] Loading best_qat.pt...")
+    
+    m = torch.load(MODEL, map_location=device, weights_only=False)
     m = (m['model'] if isinstance(m, dict) else m).float().eval()
 
-    net = FullDPU(m).eval()
-    inp = torch.randn(1, 3, 512, 512)
+    # Sync ECA (Fix YOLO version error by swapping class)
+    for module in m.modules():
+        if module.__class__.__name__ == 'ECA':
+            if hasattr(module, 'fc1') and hasattr(module, 'fc2'):
+                # This is actually the old SE network. Assign it to LegacyECA
+                module.__class__ = LegacyECA
+            else:
+                # Other fixes (if it's a real ECA)
+                if not hasattr(module, 'conv'):
+                    for name, child in module.named_children():
+                        if isinstance(child, nn.Conv1d):
+                            module.conv = child
+                            break
+                if hasattr(module, 'gate') and not hasattr(module, 'sigmoid'):
+                    module.sigmoid = module.gate
+                elif hasattr(module, 'sigmoid') and not hasattr(module, 'gate'):
+                    module.gate = module.sigmoid
+                if hasattr(module, 'gate') and isinstance(module.gate, nn.Hardsigmoid):
+                    module.gate.once = False
+                    module.gate.inplace = False
+                if hasattr(module, 'act') and not hasattr(module, 'relu'):
+                    module.relu = module.act
+                elif hasattr(module, 'relu') and not hasattr(module, 'act'):
+                    module.act = module.relu
+
+    net = DecoupledDPU(m).to(device).eval()
+    inp = torch.randn(1, 3, 512, 512).to(device)
 
     # Check output shape
     with torch.no_grad():
         outs = net(inp)
-    print(f"[CHECK] Output tensor count: {len(outs)}")
+    print(f"[CHECK] Number of output tensors: {len(outs)}")
     for k, o in enumerate(outs):
         print(f"  Scale {k}: {tuple(o.shape)}")
-    # Expected: (1,18,64,64) / (1,18,32,32) / (1,18,16,16)
 
     # Init quantizer
     q  = torch_quantizer('calib', net, (inp,), output_dir=OUT)
-    qm = q.quant_model
+    qm = q.quant_model.to(device)
 
-    # Calibrate — read one by one, do not load all into RAM
-    files = get_calib_files()
-    print(f"[INFO] Starting calibration on {len(files)} images...")
+    # Optimization: Use batch_size=1 to completely match dummy input when tracing Vitis-AI graph
+    # (Avoid BATCH_SIZE shape mismatch error in NNDCT)
+    dataset = CalibDataset(CALIB, limit=None)
+    batch_size = 1
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    print(f"[INFO] Start calibrating {len(dataset)} images (Batch size: {batch_size})...")
     done = 0
     with torch.no_grad():
-        for f in files:
-            tensor = load_one(os.path.join(CALIB, f))
-            if tensor is None:
-                continue
-            _ = qm(tensor)
-            done += 1
-            if done % 100 == 0:
-                print(f"  [{done}/{len(files)}]...")
+        for batch in dataloader:
+            batch = batch.to(device)
+            _ = qm(batch)
+            done += len(batch)
+            print(f"  [{min(done, len(dataset))}/{len(dataset)}]...")
 
-    print(f"[INFO] Calibrated {done} images.")
+    print(f"[INFO] Finished calibrating {done} images.")
     q.export_quant_config()
-    print(f"[DONE] Calibration complete. Data at: {OUT}")
+    print(f"[DONE] Calibration done. Data at: {OUT}")
 
 if __name__ == "__main__":
     main()
