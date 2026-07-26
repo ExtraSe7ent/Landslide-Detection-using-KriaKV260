@@ -1,14 +1,14 @@
 """
-quantize_calib.py — Bước CALIB của quantize INT8 cho LS-YOLO (head Decoupled_Detect).
-Chạy TRONG Docker Vitis-AI (conda env vitis-ai-pytorch). Thay cho script PDF
-(vốn viết cho head Detect chuẩn).
+quantize_calib.py — CALIB step of INT8 quantize for LS-YOLO (Decoupled_Detect head).
+Run INSIDE Vitis-AI Docker (conda env vitis-ai-pytorch). Replaces the PDF script
+(which was written for the standard Detect head).
 
-Layout giả định trên máy/board:
-  /workspace/best.pt           <- model đã train
-  /workspace/calib_images/     <- ~200 ảnh calib
+Assumed layout on machine/board:
+  /workspace/best.pt           <- trained model
+  /workspace/calib_images/     <- ~200 calib images
   /workspace/compiled/         <- output
-  /workspace/LS-YOLO/          <- source repo (chứa kv260_export/ này)
-Đổi qua biến môi trường nếu khác (MODEL, CALIB, OUT, LSYOLO_SRC).
+  /workspace/LS-YOLO/          <- source repo (contains this kv260_export/ folder)
+Change via environment variables if different (MODEL, CALIB, OUT, LSYOLO_SRC).
 """
 import os, sys, glob
 import numpy as np
@@ -27,7 +27,7 @@ from utils.augmentations import letterbox
 MODEL = os.environ.get("MODEL", "/workspace/best.pt")
 CALIB = os.environ.get("CALIB", "/workspace/calib_images")
 OUT   = os.environ.get("OUT",   "/workspace/compiled")
-IMG   = 512   # khớp imgsz lúc train UAV (best.pt mAP 0.927); chia hết 32
+IMG   = 512   # matches imgsz during UAV train (best.pt mAP 0.927); divisible by 32
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -46,10 +46,10 @@ def calib_data(n=200):
         im = cv2.imread(f)
         if im is None:
             continue
-        im = letterbox(im, (IMG, IMG), auto=False)[0][:, :, ::-1].transpose(2, 0, 1)  # letterbox(giữ tỉ lệ), BGR->RGB, HWC->CHW
+        im = letterbox(im, (IMG, IMG), auto=False)[0][:, :, ::-1].transpose(2, 0, 1)  # letterbox(keep ratio), BGR->RGB, HWC->CHW
         imgs.append(im.astype(np.float32) / 255.0)
     if not imgs:
-        raise RuntimeError(f"Không đọc được ảnh calib nào trong {CALIB}")
+        raise RuntimeError(f"Could not read any calib images in {CALIB}")
     return torch.tensor(np.array(imgs))
 
 
@@ -59,17 +59,17 @@ def main():
 
     with torch.no_grad():
         out = net(inp)
-    print(f"[CHECK] {len(out)} output (mỗi level 1): {[tuple(o.shape) for o in out]}")
+    print(f"[CHECK] {len(out)} outputs (1 per level): {[tuple(o.shape) for o in out]}")
 
     q = torch_quantizer("calib", net, (inp,), output_dir=OUT)
     qm = q.quant_model
     data = calib_data()
-    print(f"[INFO] Calibrating {len(data)} ảnh...")
+    print(f"[INFO] Calibrating {len(data)} images...")
     with torch.no_grad():
         for i in range(len(data)):
             _ = qm(data[i].unsqueeze(0))
     q.export_quant_config()
-    print("[DONE] Calib xong:", OUT)
+    print("[DONE] Calib complete:", OUT)
 
 
 if __name__ == "__main__":

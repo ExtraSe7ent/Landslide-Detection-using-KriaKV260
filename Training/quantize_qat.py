@@ -1,20 +1,20 @@
 """
-quantize_qat.py — QAT THẬT cho LS-YOLO bằng Vitis-AI QatProcessor.
-Chạy TRONG Docker Vitis-AI (conda env vitis-ai-pytorch), CÓ GPU.
+quantize_qat.py — REAL QAT for LS-YOLO using Vitis-AI QatProcessor.
+Run INSIDE Vitis-AI Docker (conda env vitis-ai-pytorch), WITH GPU.
 
-Đây là bản QAT để DEPLOY (khác qat_finetune.py vốn là QAT mô phỏng STE local).
-Luồng QatProcessor: trainable_model -> fine-tune -> to_deployable -> export_xmodel.
+This is the QAT version for DEPLOYMENT (unlike qat_finetune.py which is local STE fake-quant).
+QatProcessor flow: trainable_model -> fine-tune -> to_deployable -> export_xmodel.
 
-LƯU Ý chia khâu:
-  - QAT train cần loss trên ĐẦU RA HEAD dạng training -> ta train trên FULL model
-    (models.yolo.Model, head Decoupled_Detect ở train-mode trả [bs,na,h,w,no]).
-  - Deploy cần forward CHỈ conv -> dùng DecoupledDPU khi export.
-  Cách đơn giản & chắc: QAT trên FULL model, sau đó nạp weight đã QAT vào DecoupledDPU
-  rồi chạy quantize_calib.py + quantize_export.py như thường (PTQ trên weight đã quant-robust).
-  Bản dưới đây minh hoạ luồng QatProcessor đầy đủ; nếu env vướng head decode, dùng cách đơn giản trên.
+NOTE on workflow:
+  - QAT train needs loss on HEAD OUTPUT in training format -> we train on FULL model
+    (models.yolo.Model, Decoupled_Detect head in train-mode returns [bs,na,h,w,no]).
+  - Deployment needs forward pass of ONLY convs -> use DecoupledDPU when exporting.
+  Simple & robust way: QAT on FULL model, then load QAT weights into DecoupledDPU
+  then run quantize_calib.py + quantize_export.py as usual (PTQ on quant-robust weights).
+  This script illustrates the full QatProcessor flow; if env fails on head decode, use the simple way above.
 
-Env (đổi nếu khác):
-  MODEL=/workspace/best_qat.pt   (hoặc best.pt)  OUT=/workspace/compiled
+Env (change if different):
+  MODEL=/workspace/best_qat.pt   (or best.pt)  OUT=/workspace/compiled
 """
 import os, sys, math, yaml
 sys.path.insert(0, os.environ.get("LSYOLO_SRC", "/workspace/LS-YOLO"))
@@ -44,10 +44,10 @@ def main():
     for p in model.parameters():
         p.requires_grad_(True)
 
-    # 1) Khởi QatProcessor trên FULL model (train-mode head trả raw [bs,na,h,w,no])
+    # 1) Initialize QatProcessor on FULL model (train-mode head returns raw [bs,na,h,w,no])
     inp = torch.randn(1, 3, IMG, IMG, device=DEVICE)
     qat = QatProcessor(model, (inp,), bitwidth=8, device=torch.device(DEVICE))
-    qmodel = qat.trainable_model()              # model có fake-quant, train được
+    qmodel = qat.trainable_model()              # model with fake-quant, trainable
     qmodel.hyp, qmodel.nc, qmodel.gr = hyp, int(cfg["nc"]), 1.0
 
     # 2) Fine-tune QAT
@@ -68,11 +68,11 @@ def main():
             if step >= EPOCH_STEPS:
                 break
 
-    # 3) Chuyển sang model deploy được + export xmodel (INT8)
+    # 3) Convert to deployable model + export xmodel (INT8)
     qmodel.eval()
     deployable = qat.to_deployable(qmodel, OUT)
-    qat.export_xmodel(OUT, deploy_check=True)   # BẬT deploy_check để bắt lệch float/int8
-    print(f"[DONE] QAT xong. xmodel + checkpoint deploy tại: {OUT}")
+    qat.export_xmodel(OUT, deploy_check=True)   # ENABLE deploy_check to catch float/int8 mismatch
+    print(f"[DONE] QAT done. xmodel + deploy checkpoint at: {OUT}")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,15 @@
 """
-quant_sim_eval.py — MÔ PHỎNG INT8 kiểu Vitis-AI DPU (per-tensor, scale = 2^n,
-weight + activation) ngay trên GPU, rồi đo mAP bằng val.py.
+quant_sim_eval.py — Vitis-AI DPU style INT8 SIMULATION (per-tensor, scale = 2^n,
+weight + activation) right on the GPU, then measure mAP with val.py.
 
-Mục đích: ước lượng INT8 làm mất bao nhiêu điểm (so float 92.56% test).
-KHÔNG phải Vitis-AI thật, nhưng bắt đúng 2 đặc trưng gây mất chính:
-  - 8-bit, đối xứng, PER-TENSOR (không per-channel)
-  - scale luỹ thừa 2 (power-of-two fix_point) — thô hơn scale float
-Đây thường là CẬN TRÊN lạc quan (Vitis-AI có thêm fast_finetune); nếu sim này
-đã ~80% thì INT8 đúng là thủ phạm. Nếu sim ~90%+ thì 80% trên board phần lớn do đo sai.
+Purpose: estimate how many points INT8 drops (compared to float 92.56% test).
+This is NOT real Vitis-AI, but accurately captures 2 main characteristics that cause the drop:
+  - 8-bit, symmetric, PER-TENSOR (not per-channel)
+  - power-of-two fix_point scale — coarser than float scale
+This is usually an optimistic UPPER BOUND (Vitis-AI has fast_finetune); if this sim
+is ~80% then INT8 is indeed the culprit. If the sim is ~90%+ then 80% on board is likely due to incorrect decoding.
 
-Chạy:  python kv260_export/quant_sim_eval.py
+Run:  python kv260_export/quant_sim_eval.py
 """
 import os, sys, math, random
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -37,7 +37,7 @@ def fq(x, fp):
 
 
 class QuantSim:
-    """Fake-quant weight (1 lần) + activation (qua hook, calib rồi freeze)."""
+    """Fake-quant weight (1 time) + activation (via hook, calib then freeze)."""
     def __init__(self, model):
         self.model = model
         self.act_max, self.act_fp = {}, {}
@@ -46,18 +46,18 @@ class QuantSim:
         self._wrap()
 
     def _wrap(self):
-        # id các conv2d nằm trong Conv-wrapper (đã được hook ở mức Conv, tránh trùng)
+        # id of conv2d layers inside Conv-wrapper (already hooked at Conv level, avoid duplicate)
         inside = set()
         for m in self.model.modules():
             if m.__class__.__name__ == "Conv" and hasattr(m, "conv"):
                 inside.add(id(m.conv))
-        # 1) quant weight tất cả nn.Conv2d (per-tensor, po2) — tĩnh, làm ngay
+        # 1) quant weight for all nn.Conv2d (per-tensor, po2) — static, do immediately
         for m in self.model.modules():
             if isinstance(m, nn.Conv2d):
                 w = m.weight.data
                 fp = calc_fp(w.abs().max().item())
                 m.weight.data = fq(w, fp)
-        # 2) hook activation: Conv-wrapper output + nn.Conv2d đứng riêng
+        # 2) hook activation: Conv-wrapper output + standalone nn.Conv2d
         targets = []
         for name, m in self.model.named_modules():
             if m.__class__.__name__ == "Conv":
@@ -66,7 +66,7 @@ class QuantSim:
                 targets.append((name, m))
         for name, m in targets:
             self.handles.append(m.register_forward_hook(self._mk_hook(name)))
-        # 3) hook input ảnh
+        # 3) hook input image
         self.handles.append(self.model.register_forward_pre_hook(self._input_hook))
 
     def _mk_hook(self, key):
@@ -105,7 +105,7 @@ def letterbox_load(path):
     return torch.from_numpy(np.ascontiguousarray(im)).float().div(255)
 
 
-CFG = None  # dict data, set trong main
+CFG = None  # dict data, set in main
 
 
 def run_val(model, dataloader, tag):
@@ -132,14 +132,14 @@ def main():
 
     model = attempt_load(WEIGHTS, device=DEVICE, fuse=True).float().eval()
 
-    # dataloader test (rect, letterbox — giống val.py)
+    # test dataloader (rect, letterbox — like val.py)
     dl = create_dataloader(cfg["test"], IMGSZ, 16, 32, False,
                            pad=0.5, rect=True, workers=0, prefix="test: ")[0]
 
-    # (1) FLOAT qua cùng path — kỳ vọng ~92.5 (xác nhận harness không thiên lệch)
+    # (1) FLOAT over the same path — expect ~92.5 (verifies harness is not biased)
     run_val(model, dl, "FLOAT (sanity)")
 
-    # (2) Calib INT8 trên N_CALIB ảnh train
+    # (2) Calib INT8 on N_CALIB train images
     qs = QuantSim(model)
     train_files = [l.strip() for l in open(cfg["train"], encoding="utf-8") if l.strip()]
     random.seed(0); random.shuffle(train_files)
@@ -154,7 +154,7 @@ def main():
             _ = model(t.unsqueeze(0).to(DEVICE))
             done += 1
     qs.freeze()
-    print(f"[INFO] Calib INT8 xong trên {done} ảnh. "
+    print(f"[INFO] INT8 Calib done on {done} images. "
           f"#activation tensors quant = {len(qs.act_fp)}", flush=True)
 
     # (3) INT8-SIM

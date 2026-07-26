@@ -1,4 +1,4 @@
-"""Chạy val.py CHỈ task=test, bắt full traceback."""
+"""Run val.py ONLY for task=test, catch full traceback."""
 import os, sys, traceback
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

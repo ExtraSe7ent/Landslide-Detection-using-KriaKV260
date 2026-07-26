@@ -1,9 +1,9 @@
 """
-verify_decode.py — Chứng minh DecoupledDPU + decode_decoupled cho ra KẾT QUẢ
-GIỐNG HỆT forward gốc của model (model.model[-1] là Decoupled_Detect).
+verify_decode.py — Proves that DecoupledDPU + decode_decoupled gives EXACTLY
+the SAME RESULT as the original model forward (model.model[-1] is Decoupled_Detect).
 
-Chạy:  python kv260_export/verify_decode.py
-Không cần GPU, không cần train. PASS => logic decode trên KV260 sẽ đúng.
+Run:  python kv260_export/verify_decode.py
+No GPU needed, no training needed. PASS => decode logic on KV260 will be correct.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,11 +22,11 @@ def main():
     model.eval()
     det = model.model[-1]
 
-    x = torch.randn(1, 3, 512, 512)   # khớp imgsz deploy UAV (512)
+    x = torch.randn(1, 3, 512, 512)   # matches imgsz deploy UAV (512)
     with torch.no_grad():
-        ref = model(x)[0]                       # forward gốc (inference) -> [bs, N, 5+nc]
+        ref = model(x)[0]                       # original forward (inference) -> [bs, N, 5+nc]
         wrap = DecoupledDPU(model)
-        raw = wrap(x)                           # các map conv thô (đầu ra DPU)
+        raw = wrap(x)                           # raw conv maps (DPU output)
         dec = decode_decoupled(raw, det.anchors, det.stride, int(det.nc), int(det.na))
 
     print("ref :", tuple(ref.shape))
@@ -37,7 +37,7 @@ def main():
     print(f"shape match: {same_shape} | max abs diff: {maxdiff:.3e}")
     ok = same_shape and torch.allclose(ref, dec, atol=1e-4, rtol=1e-4)
     print("HEAD CONSTANTS for demo:", head_constants(model))
-    print("\n==>", "PASS [OK] decode khớp forward gốc" if ok else "FAIL [X] decode KHÔNG khớp")
+    print("\n==>", "PASS [OK] decode matches original forward" if ok else "FAIL [X] decode DOES NOT match")
     sys.exit(0 if ok else 1)
 
 

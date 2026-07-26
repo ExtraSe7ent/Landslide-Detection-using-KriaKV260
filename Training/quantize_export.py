@@ -1,8 +1,8 @@
 """
-quantize_export.py — Bước TEST + xuất .xmodel cho LS-YOLO (head Decoupled_Detect).
-Chạy SAU quantize_calib.py, trong cùng Docker Vitis-AI.
-Cũng ghi head_constants.json (anchors/stride/nc/na) cạnh xmodel để demo trên
-KV260 decode đúng — KHÔNG hardcode nhầm anchors.
+quantize_export.py — TEST step + export .xmodel for LS-YOLO (Decoupled_Detect head).
+Run AFTER quantize_calib.py, in the same Vitis-AI Docker.
+Also writes head_constants.json (anchors/stride/nc/na) next to xmodel for demo on
+KV260 to decode correctly — DO NOT hardcode wrong anchors.
 """
 import os, sys, json
 import torch
@@ -17,7 +17,7 @@ from ls_yolo_dpu import DecoupledDPU, head_constants
 
 MODEL = os.environ.get("MODEL", "/workspace/best.pt")
 OUT   = os.environ.get("OUT",   "/workspace/compiled")
-IMG   = 512   # khớp imgsz lúc train UAV (best.pt mAP 0.927); chia hết 32
+IMG   = 512   # matches imgsz during UAV train (best.pt mAP 0.927); divisible by 32
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -25,7 +25,7 @@ def main():
     ck = torch.load(MODEL, map_location="cpu", weights_only=False)
     model = (ck["model"] if isinstance(ck, dict) else ck).float().eval()
 
-    # lưu hằng số head để demo dùng (đúng anchors/stride của model)
+    # save head constants for demo usage (correct anchors/stride of the model)
     consts = head_constants(model)
     with open(os.path.join(OUT, "head_constants.json"), "w") as f:
         json.dump(consts, f, indent=2)
@@ -38,7 +38,7 @@ def main():
     with torch.no_grad():
         _ = q.quant_model(inp)
     q.export_xmodel(deploy_check=False, output_dir=OUT)
-    print("[DONE] Xuất xong:", os.path.join(OUT, "DecoupledDPU_int.xmodel"))
+    print("[DONE] Export complete:", os.path.join(OUT, "DecoupledDPU_int.xmodel"))
 
 
 if __name__ == "__main__":

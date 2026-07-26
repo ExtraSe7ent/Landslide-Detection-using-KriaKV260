@@ -1,5 +1,5 @@
-"""Chạy val.py CHÍNH CHỦ của repo cho model DPU trên cả val và test split.
-   workers=0 + main-guard để tránh lỗi spawn của Windows."""
+"""Run the repo's ORIGINAL val.py for DPU model on both val and test splits.
+   workers=0 + main-guard to avoid Windows spawn errors."""
 import os, sys
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

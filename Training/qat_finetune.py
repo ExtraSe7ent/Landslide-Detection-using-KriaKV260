@@ -1,11 +1,11 @@
 """
-qat_finetune.py — QAT thật (mô phỏng) tại máy: fine-tune model có chèn fake-quant
-INT8 (STE) bằng đúng ComputeLoss của repo, rồi đo INT8 trước/sau QAT.
+qat_finetune.py — Real QAT (simulation) on local machine: fine-tune model injected with fake-quant
+INT8 (STE) using the repo's original ComputeLoss, then measure INT8 before/after QAT.
 
-Mục đích: chứng minh "vừa train vừa quantize" kéo lại phần INT8 mất (~4đ).
-Bản deploy cuối nên chạy QAT bằng Vitis-AI QatProcessor; đây là bản local/dự phòng.
+Purpose: prove that "quantize-aware training" recovers the INT8 accuracy drop (~4 points).
+The final deploy version should run QAT using Vitis-AI QatProcessor; this is a local/fallback version.
 
-Chạy:  python kv260_export/qat_finetune.py [n_steps]
+Run:  python kv260_export/qat_finetune.py [n_steps]
 """
 import os, sys, math, random
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -37,12 +37,12 @@ def fq(x, fp):
 
 
 def ste(x, fp):
-    """fake-quant với straight-through estimator (gradient đi thẳng)."""
+    """fake-quant with straight-through estimator (gradient passes directly)."""
     return x + (fq(x, fp) - x).detach()
 
 
 class QATConv2d(nn.Module):
-    """Bọc 1 nn.Conv2d: fake-quant weight (STE) mỗi forward. Weight gốc vẫn trainable."""
+    """Wraps an nn.Conv2d: fake-quant weight (STE) on each forward pass. Original weight remains trainable."""
     def __init__(self, conv):
         super().__init__()
         self.conv = conv
@@ -72,11 +72,11 @@ class QAT:
 
     def _hook_acts(self):
         for name, m in self.model.named_modules():
-            if m.__class__.__name__ == "Conv":      # output post-act (sau BN+act)
+            if m.__class__.__name__ == "Conv":      # post-act output (after BN+act)
                 self.handles.append(m.register_forward_hook(self._mk(name)))
 
     def unwrap(self):
-        """Gỡ QATConv2d + bỏ hook -> model float SẠCH (weight đã quant-robust)."""
+        """Remove QATConv2d + remove hooks -> CLEAN float model (quant-robust weights)."""
         for h in self.handles:
             h.remove()
         for name, m in list(self.model.named_modules()):
@@ -138,7 +138,7 @@ def main():
     model.hyp = hyp
     model.nc = 1
     model.gr = 1.0
-    for p in model.parameters():     # attempt_load đóng băng grad cho inference -> bật lại
+    for p in model.parameters():     # attempt_load freezes grad for inference -> turn it back on
         p.requires_grad_(True)
 
     test_dl = create_dataloader(CFG["test"], IMGSZ, 16, 32, False,
@@ -148,7 +148,7 @@ def main():
 
     qat = QAT(model)
 
-    # calib fix_point trên ~100 batch nhỏ
+    # calib fix_point on ~100 small batches
     model.eval()
     with torch.no_grad():
         for i, (imgs, _, _, _) in enumerate(train_dl):
@@ -156,10 +156,10 @@ def main():
             if i >= 12:
                 break
     qat.freeze()
-    print(f"[INFO] calib xong, #act tensors = {len(qat.act_fp)}", flush=True)
+    print(f"[INFO] calib done, #act tensors = {len(qat.act_fp)}", flush=True)
 
-    # đo INT8 TRƯỚC QAT
-    eval_int8(model, test_dl, "INT8 trước QAT")
+    # measure INT8 BEFORE QAT
+    eval_int8(model, test_dl, "INT8 before QAT")
 
     # fine-tune QAT
     compute_loss = ComputeLoss(model)
@@ -179,18 +179,18 @@ def main():
             if step >= N_STEPS:
                 break
 
-    # đo INT8 SAU QAT (model vẫn còn fake-quant)
-    eval_int8(model, test_dl, "INT8 sau QAT")
+    # measure INT8 AFTER QAT (model still has fake-quant)
+    eval_int8(model, test_dl, "INT8 after QAT")
 
-    # Gỡ wrapper -> lưu checkpoint float SẠCH (quant-robust) làm DỰ PHÒNG
+    # Unwrap wrapper -> save CLEAN float checkpoint (quant-robust) as FALLBACK
     qat.unwrap()
     model.eval()
     ckpt = {"model": model.half(), "epoch": -1, "best_fitness": None,
-            "qat_note": "QAT fine-tuned (fake-quant STE local). Nap vao Vitis-AI de PTQ/QAT that."}
+            "qat_note": "QAT fine-tuned (fake-quant STE local). Load into Vitis-AI for real PTQ/QAT."}
     torch.save(ckpt, SAVE)
-    print(f"[SAVE] checkpoint QAT du phong -> {SAVE}", flush=True)
+    print(f"[SAVE] Fallback QAT checkpoint -> {SAVE}", flush=True)
     model.float()
-    eval_int8(model, test_dl, "FLOAT sau QAT (checkpoint da luu)")
+    eval_int8(model, test_dl, "FLOAT after QAT (saved checkpoint)")
 
 
 if __name__ == "__main__":
