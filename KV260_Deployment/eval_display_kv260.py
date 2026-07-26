@@ -370,7 +370,7 @@ def main():
     if not all_preds_map:
         return
 
-    # Tính metrics
+    # Calculate metrics
     print("\n[INFO] Calculating metrics...")
     p50, r50, ap50 = compute_metrics(all_preds_map, all_labels, iou_thresh=0.5)
 
